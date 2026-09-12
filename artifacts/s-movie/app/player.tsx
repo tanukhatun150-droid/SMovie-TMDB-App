@@ -33,6 +33,7 @@ import {
   View,
 } from "react-native";
 import SmartImage from "@/components/SmartImage";
+import EmbedPlayer from "@/components/EmbedPlayer";
 import { findMovie } from "@/data/movies";
 import { haptic } from "@/lib/haptics";
 import { tmdb, tmdbImg, proxyUrl, type TMDBEpisode, type TMDBDetail } from "@/lib/tmdb";
@@ -318,14 +319,28 @@ export default function PlayerScreen() {
       }
 
       // ── Step 2: MovieBox/Aoneroom online playback ────────────────────────────
+      // Online playback uses the embed player so the user can choose a server.
+      // VidSrc Hindi is the first server shown by EmbedPlayer.
+      if (tmdbId) {
+        if (!cancelled) {
+          setStreamResult({
+            url: "",
+            subtitles: false,
+            isEmbed: true,
+            source: "VidSrc Hindi",
+            allSources: [],
+            currentIndex: 0,
+            isAutoSwitching: false,
+          });
+        }
+        return;
+      }
+
+      // ── Step 3: Legacy title has no TMDB ID ─────────────────────────────────
       const movieBoxTitle = title_param || movie?.title || id || "";
       if (movieBoxTitle.trim()) {
         try {
-          const playback = await getMovieBoxPlayback(
-            movieBoxTitle,
-            isTV ? s : 0,
-            isTV ? e : 0,
-          );
+          const playback = await getMovieBoxPlayback(movieBoxTitle, isTV ? s : 0, isTV ? e : 0);
           if (!cancelled && playback?.url) {
             setStreamResult({
               url: playback.url,
@@ -339,11 +354,10 @@ export default function PlayerScreen() {
             return;
           }
         } catch {
-          // Show the unavailable state below when no playable URL is returned.
+          // Fall through to the unavailable state.
         }
       }
 
-      // ── Step 3: MovieBox has no playable URL ────────────────────────────────
       if (!cancelled) {
         setStreamResult({
           url: "",
@@ -522,41 +536,59 @@ export default function PlayerScreen() {
   return (
     <View style={isPortraitWeb ? { flex: 1, overflow: "hidden" } : { flex: 1 }}>
       <View style={webLandscapeStyle}>
-        <NativePlayerScreen
-          movieId={id ?? ""}
-          videoUrl={resolvedUrl}
-          title={title_param || movie?.title}
-          posterUri={movie?.poster && typeof movie.poster === "object" && "uri" in movie.poster ? (movie.poster as any).uri : undefined}
-          onBack={handleBack}
-          orientationLocked={orientationLocked}
-          isTV={isTV}
-          tmdbId={tmdbId}
-          initialSeason={currentSeason}
-          initialEpisode={currentEpisode}
-          onTimeout={tryNextSource}
-          onEnded={() => nextEp && setAutoplayCountdown(5)}
-          onCompletion={() => {
-            if (id) void trackWatchCompletion(id, [], 1);
-          }}
-          seasons={seasons}
-          episodes={episodes}
-          prevEpisode={prevEp}
-          nextEpisode={nextEp}
-           extractionSources={streamResult?.qualitySources ?? []}
-           extractionSubtitles={streamResult?.subtitleTracks ?? []}
-          onPrevEpisode={() => {
-            if (prevEp) {
-              router.setParams({ season: String(prevEp.season), episode: String(prevEp.episode) });
-              setStreamResult(null);
-            }
-          }}
-          onNextEpisode={() => {
-            if (nextEp) {
-              router.setParams({ season: String(nextEp.season), episode: String(nextEp.episode) });
-              setStreamResult(null);
-            }
-          }}
-        />
+        {streamResult?.isEmbed ? (
+          <EmbedPlayer
+            tmdbId={tmdbId ?? 0}
+            mediaType={isTV ? "tv" : "movie"}
+            season={currentSeason}
+            episode={currentEpisode}
+            title={title_param || movie?.title}
+            nextEpisode={nextEp}
+            onBack={handleBack}
+            onNextEpisode={() => {
+              if (nextEp) {
+                router.setParams({ season: String(nextEp.season), episode: String(nextEp.episode) });
+                setStreamResult(null);
+              }
+            }}
+          />
+        ) : (
+          <NativePlayerScreen
+            movieId={id ?? ""}
+            videoUrl={resolvedUrl}
+            title={title_param || movie?.title}
+            posterUri={movie?.poster && typeof movie.poster === "object" && "uri" in movie.poster ? (movie.poster as any).uri : undefined}
+            onBack={handleBack}
+            orientationLocked={orientationLocked}
+            isTV={isTV}
+            tmdbId={tmdbId}
+            initialSeason={currentSeason}
+            initialEpisode={currentEpisode}
+            onTimeout={tryNextSource}
+            onEnded={() => nextEp && setAutoplayCountdown(5)}
+            onCompletion={() => {
+              if (id) void trackWatchCompletion(id, [], 1);
+            }}
+            seasons={seasons}
+            episodes={episodes}
+            prevEpisode={prevEp}
+            nextEpisode={nextEp}
+            extractionSources={streamResult?.qualitySources ?? []}
+            extractionSubtitles={streamResult?.subtitleTracks ?? []}
+            onPrevEpisode={() => {
+              if (prevEp) {
+                router.setParams({ season: String(prevEp.season), episode: String(prevEp.episode) });
+                setStreamResult(null);
+              }
+            }}
+            onNextEpisode={() => {
+              if (nextEp) {
+                router.setParams({ season: String(nextEp.season), episode: String(nextEp.episode) });
+                setStreamResult(null);
+              }
+            }}
+          />
+        )}
 
         {/* Autoplay Next Overlay */}
         {autoplayCountdown !== null && nextEp && (

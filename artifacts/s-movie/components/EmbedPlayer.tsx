@@ -2,14 +2,11 @@
  * EmbedPlayer — v3.0 Netflix-style WebView player
  *
  * Improvements over v2:
- *   • Source racer: on mount, HEAD-pings all servers concurrently and sorts
- *     them fastest-first. Auto-switch hits the already-confirmed best server.
- *   • Also fires /api/stream/race (backend) for server-side latency data.
  *   • Aggressive ad/overlay blocking: eliminates popups, full-screen ads,
  *     redirect navigations, cookie banners, and overlay divs via CSS + JS.
  *   • Video plays as-is inside the WebView — looks clean and Netflix-like
  *     because all third-party chrome/ads are stripped.
- *   • No server-selection buttons shown to the user ever.
+ *   • User-facing server picker with a Hindi-first VidSrc embed.
  */
 
 import React, { useState, useRef, useCallback, useEffect } from "react";
@@ -20,12 +17,11 @@ import {
   StyleSheet,
   ActivityIndicator,
   Platform,
+  ScrollView,
 } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { Feather } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
-import { raceSourceLatency, type RacedSource } from "@/lib/sourceRacer";
-import { getApiBase } from "@/lib/streamingService";
 
 // ─── Source definitions ────────────────────────────────────────────────────────
 
@@ -36,11 +32,37 @@ export interface EmbedSource {
   urlTV: (tmdbId: number, season: number, episode: number) => string;
 }
 
-export const EMBED_SOURCES: EmbedSource[] = [];
+// Keep the user-facing list short and intentional. The first source is the
+// requested Hindi embed; the remaining servers are practical fallbacks.
+export const EMBED_SOURCES: EmbedSource[] = [
+  {
+    name: "VidSrc Hindi",
+    subtitle: "Hindi Embed",
+    urlMovie: (id) => `https://vidsrc.to/embed/movie/${id}?ds_lang=hi`,
+    urlTV: (id, s, e) => `https://vidsrc.to/embed/tv/${id}/${s}/${e}?ds_lang=hi`,
+  },
+  {
+    name: "VidSrc",
+    subtitle: "Default Embed",
+    urlMovie: (id) => `https://vidsrc.to/embed/movie/${id}`,
+    urlTV: (id, s, e) => `https://vidsrc.to/embed/tv/${id}/${s}/${e}`,
+  },
+  {
+    name: "VidSrc.me",
+    subtitle: "Backup Embed",
+    urlMovie: (id) => `https://vidsrc.me/embed/movie?tmdb=${id}`,
+    urlTV: (id, s, e) => `https://vidsrc.me/embed/tv?tmdb=${id}&season=${s}&episode=${e}`,
+  },
+  {
+    name: "MultiEmbed",
+    subtitle: "Backup Server",
+    urlMovie: (id) => `https://multiembed.mov/directstream.php?video_id=${id}&tmdb=1`,
+    urlTV: (id, s, e) => `https://multiembed.mov/directstream.php?video_id=${id}&tmdb=1&s=${s}&e=${e}`,
+  },
+];
 
 // ─── Timing constants ──────────────────────────────────────────────────────────
 
-const AUTO_SWITCH_MS   = 12000; // switch server if no video after 12s
 const NEXT_EP_COUNTDOWN = 5;    // seconds before auto-playing next episode
 
 // ─── Ad-blocking JS — injected BEFORE page content loads ──────────────────────
@@ -257,7 +279,7 @@ export default function EmbedPlayer({
   onNextEpisode,
   onProgress,
 }: EmbedPlayerProps) {
-  // Source ordering — starts as default array index, re-sorted after latency race
+  // Source ordering — starts with the Hindi server and changes only by user choice.
   const [sourceOrder, setSourceOrder] = useState<number[]>(
     EMBED_SOURCES.map((_, i) => i),
   );
@@ -265,10 +287,9 @@ export default function EmbedPlayer({
   const [loading, setLoading]     = useState(true);
   const [videoStarted, setVideoStarted] = useState(false);
   const [nextEpCountdown, setNextEpCountdown] = useState<number | null>(null);
-  const [raceStatus, setRaceStatus] = useState<"pending" | "done">("pending");
+  const [showServerPicker, setShowServerPicker] = useState(false);
 
   const webViewRef         = useRef<WebView>(null);
-  const autoSwitchTimer    = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownInterval  = useRef<ReturnType<typeof setInterval> | null>(null);
   const nearEndFired        = useRef(false);
   const videoStartedRef    = useRef(false);
@@ -283,100 +304,11 @@ export default function EmbedPlayer({
       ? currentSource.urlMovie(tmdbId)
       : currentSource.urlTV(tmdbId, season, episode);
 
-  // ── Latency race on mount ─────────────────────────────────────────────────
-  // Fire HEAD probes to all sources concurrently. Sort the source order by
-  // measured latency. The first auto-switch will go to the second fastest
-  // (winner is already loaded), and so on.
+  // Reset to the Hindi-first source whenever the title or episode changes.
   useEffect(() => {
-    let cancelled = false;
-
-    const run = async () => {
-      const cacheKey = `ep-${tmdbId}-${mediaType}-${season}-${episode}`;
-      const inputs = EMBED_SOURCES.map((src) => ({
-        url:    mediaType === "movie" ? src.urlMovie(tmdbId) : src.urlTV(tmdbId, season, episode),
-        source: src.name,
-      }));
-
-      // Client-side race
-      const clientRace = raceSourceLatency(inputs, 2500, cacheKey);
-
-      // Server-side race (backend HEAD probes — more reliable behind server IP)
-      // Uses apiClient so auth token + X-S-Movie-Client header are injected — /api/stream/race is protected
-      const serverRace = import("@/lib/apiClient").then(({ apiClient }) =>
-        apiClient.get<{ ranked: { url: string; source: string; latencyMs: number; ok: boolean }[] }>(
-          "/stream/race",
-          { id: String(tmdbId), type: mediaType, season: String(season), episode: String(episode) },
-          { timeoutMs: 5000 },
-        ).catch(() => null)
-      ).catch(() => null);
-
-      // Use whichever resolves first, merge second result in
-      const [clientResult, serverResult] = await Promise.all([clientRace, serverRace]);
-      if (cancelled) return;
-
-      // Build name → latency maps from both sources
-      const latencyMap = new Map<string, number>();
-
-      // Server-side results (more authoritative — behind server IP)
-      if (serverResult?.ranked) {
-        for (const r of serverResult.ranked) {
-          if (r.ok) latencyMap.set(r.source.toLowerCase(), r.latencyMs);
-        }
-      }
-
-      // Client-side results fill gaps
-      for (const r of clientResult.ranked) {
-        const key = r.source.toLowerCase();
-        if (!latencyMap.has(key) && r.ok) latencyMap.set(key, r.latencyMs);
-      }
-
-      // Re-sort EMBED_SOURCES indices by latency
-      const sorted = EMBED_SOURCES
-        .map((src, idx) => {
-          const key = src.name.toLowerCase().replace(/\s+/g, "");
-          // Match against name, domain-like substrings
-          let latency = Infinity;
-          for (const [k, v] of latencyMap.entries()) {
-            if (key.includes(k) || k.includes(key)) { latency = v; break; }
-          }
-          return { idx, latency };
-        })
-        .sort((a, b) => a.latency - b.latency)
-        .map((x) => x.idx);
-
-      setSourceOrder(sorted);
-      setRaceStatus("done");
-
-      // If first source hasn't started video yet, switch to confirmed fastest
-      if (!videoStartedRef.current && sorted[0] !== currentSourceIdx) {
-        setOrderIdx(0); // re-point to the now-sorted fastest
-      }
-    };
-
-    run().catch(() => {});
-    return () => { cancelled = true; };
+    setSourceOrder(EMBED_SOURCES.map((_, index) => index));
+    setOrderIdx(0);
   }, [tmdbId, mediaType, season, episode]);
-
-  // ── Auto-switch timer ─────────────────────────────────────────────────────
-  const switchToNext = useCallback(() => {
-    if (videoStartedRef.current) return;
-    setOrderIdx((prev) => {
-      const next = prev + 1;
-      if (next >= sourceOrder.length) return prev; // all exhausted — stay
-      return next;
-    });
-  }, [sourceOrder.length]);
-
-  const startAutoSwitchTimer = useCallback(() => {
-    if (autoSwitchTimer.current) clearTimeout(autoSwitchTimer.current);
-    autoSwitchTimer.current = setTimeout(() => {
-      if (!videoStartedRef.current) switchToNext();
-    }, AUTO_SWITCH_MS);
-  }, [switchToNext]);
-
-  useEffect(() => {
-    if (videoStarted && autoSwitchTimer.current) clearTimeout(autoSwitchTimer.current);
-  }, [videoStarted]);
 
   // Reset on source change
   useEffect(() => {
@@ -384,8 +316,6 @@ export default function EmbedPlayer({
     setVideoStarted(false);
     videoStartedRef.current = false;
     nearEndFired.current = false;
-    startAutoSwitchTimer();
-    return () => { if (autoSwitchTimer.current) clearTimeout(autoSwitchTimer.current); };
   }, [orderIdx, tmdbId, season, episode]);
 
 
@@ -440,11 +370,9 @@ export default function EmbedPlayer({
         nearEndFired.current = true;
         startNextEpCountdown();
       }
-      if (msg === "video_error") {
-        if (!videoStartedRef.current) switchToNext();
-      }
+      if (msg === "video_error") setLoading(false);
     },
-    [onProgress, startNextEpCountdown, mediaType, switchToNext],
+    [onProgress, startNextEpCountdown, mediaType],
   );
 
   const handleLoadStart = useCallback(() => { setLoading(true); }, []);
@@ -452,18 +380,68 @@ export default function EmbedPlayer({
   const handleLoadEnd = useCallback(() => {
     setLoading(false);
     webViewRef.current?.injectJavaScript(INJECT_AFTER);
-    startAutoSwitchTimer();
-  }, [startAutoSwitchTimer]);
+  }, []);
 
   const handleError = useCallback(() => {
     setLoading(false);
-    if (!videoStartedRef.current) switchToNext();
-  }, [switchToNext]);
+  }, []);
 
   const cancelNextEp = useCallback(() => {
     if (countdownInterval.current) clearInterval(countdownInterval.current);
     setNextEpCountdown(null);
   }, []);
+
+  const selectServer = useCallback((index: number) => {
+    setSourceOrder((previous) => [index, ...previous.filter((item) => item !== index)]);
+    setOrderIdx(0);
+    setShowServerPicker(false);
+    setLoading(true);
+    setVideoStarted(false);
+    videoStartedRef.current = false;
+  }, []);
+
+  const serverPicker = (
+    <View style={styles.serverPicker}>
+      <View style={styles.serverPickerHeader}>
+        <Text style={styles.serverPickerTitle}>Choose server</Text>
+        <Text style={styles.serverPickerStatus}>
+          Ready
+        </Text>
+      </View>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.serverList}
+      >
+        {EMBED_SOURCES.map((source, index) => {
+          const active = currentSourceIdx === index;
+          return (
+            <Pressable
+              key={source.name}
+              onPress={() => selectServer(index)}
+              style={({ pressed }) => [
+                styles.serverChip,
+                active && styles.serverChipActive,
+                pressed && { opacity: 0.72 },
+              ]}
+            >
+              <Feather
+                name={source.name === "VidSrc Hindi" ? "globe" : "server"}
+                size={14}
+                color={active ? "#fff" : "#c4c4c4"}
+              />
+              <View>
+                <Text style={[styles.serverChipText, active && styles.serverChipTextActive]}>
+                  {source.name}
+                </Text>
+                <Text style={styles.serverChipSubtitle}>{source.subtitle}</Text>
+              </View>
+            </Pressable>
+          );
+        })}
+      </ScrollView>
+    </View>
+  );
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -502,7 +480,17 @@ export default function EmbedPlayer({
               {mediaType === "tv" ? `  S${season}:E${episode}` : ""}
             </Text>
           ) : null}
+          <Pressable
+            onPress={() => setShowServerPicker((visible) => !visible)}
+            style={({ pressed }) => [styles.serverButton, pressed && { opacity: 0.7 }]}
+            accessibilityRole="button"
+            accessibilityLabel="Choose streaming server"
+          >
+            <Feather name="server" size={15} color="#fff" />
+            <Text style={styles.serverButtonText}>Servers</Text>
+          </Pressable>
         </View>
+        {showServerPicker && serverPicker}
       </View>
     );
   }
@@ -570,8 +558,17 @@ export default function EmbedPlayer({
         ) : (
           <View style={{ flex: 1 }} />
         )}
-
+        <Pressable
+          onPress={() => setShowServerPicker((visible) => !visible)}
+          style={({ pressed }) => [styles.serverButton, pressed && { opacity: 0.7 }]}
+          accessibilityRole="button"
+          accessibilityLabel="Choose streaming server"
+        >
+          <Feather name="server" size={15} color="#fff" />
+          <Text style={styles.serverButtonText}>Servers</Text>
+        </Pressable>
       </View>
+      {showServerPicker && serverPicker}
 
       {/* Next Episode Countdown Banner */}
       {nextEpCountdown !== null && nextEpisode && (
@@ -638,6 +635,85 @@ const styles = StyleSheet.create({
     textShadowColor: "rgba(0,0,0,0.9)",
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 4,
+  },
+  serverButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+    borderRadius: 18,
+    backgroundColor: "rgba(20,20,20,0.82)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.18)",
+  },
+  serverButtonText: {
+    color: "#fff",
+    fontSize: 12,
+    fontFamily: "Inter_700Bold",
+  },
+  serverPicker: {
+    position: "absolute",
+    top: 82,
+    left: 16,
+    right: 16,
+    zIndex: 120,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    backgroundColor: "rgba(13,13,13,0.96)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  serverPickerHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 4,
+    marginBottom: 10,
+  },
+  serverPickerTitle: {
+    color: "#fff",
+    fontSize: 13,
+    fontFamily: "Inter_700Bold",
+  },
+  serverPickerStatus: {
+    color: "#8d8d8d",
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+  },
+  serverList: {
+    gap: 8,
+  },
+  serverChip: {
+    minWidth: 126,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+    borderRadius: 12,
+    backgroundColor: "rgba(255,255,255,0.07)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.1)",
+  },
+  serverChipActive: {
+    backgroundColor: "rgba(229,9,20,0.28)",
+    borderColor: "#e50914",
+  },
+  serverChipText: {
+    color: "#c4c4c4",
+    fontSize: 12,
+    fontFamily: "Inter_700Bold",
+  },
+  serverChipTextActive: {
+    color: "#fff",
+  },
+  serverChipSubtitle: {
+    color: "#7b7b7b",
+    fontSize: 10,
+    fontFamily: "Inter_400Regular",
+    marginTop: 2,
   },
   nextEpBanner: {
     position: "absolute",
